@@ -4,7 +4,6 @@ use clap::Parser;
 use rcgen::{generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
-use time::{OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
@@ -33,13 +32,13 @@ struct Args {
 /// Generate a self-signed certificate
 fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let subject_alt_names = vec!["localhost".to_string()];
-    let cert = generate_simple_self_signed(subject_alt_names)?;
-    let cert_der = cert.cert;
-    let key_der = cert.key_pair;
+    let certified_key = generate_simple_self_signed(subject_alt_names)?;
+    let cert_der = CertificateDer::from(certified_key.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(certified_key.key_pair.serialize_der().into());
     
     Ok((
         vec![cert_der],
-        key_der.into(),
+        key_der,
     ))
 }
 
