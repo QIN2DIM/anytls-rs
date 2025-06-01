@@ -329,17 +329,54 @@ impl Session {
         // Spawn read task
         tokio::spawn(async move {
             if let Err(e) = self_read.read_loop().await {
-                error!("Session {} read loop error: {}", self_read.id, e);
+                // Only log non-critical errors
+                match &e {
+                    AnyTlsError::AuthenticationFailed => {
+                        error!("Session {} authentication failed", self_read.id);
+                        let _ = self_read.close().await;
+                    }
+                    AnyTlsError::Protocol(_) => {
+                        error!("Session {} protocol error: {}", self_read.id, e);
+                        let _ = self_read.close().await;
+                    }
+                    AnyTlsError::Io(io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        debug!("Session {} read loop ended: connection closed", self_read.id);
+                        let _ = self_read.close().await;
+                    }
+                    _ => {
+                        error!("Session {} read loop error: {}", self_read.id, e);
+                        // For other errors, don't immediately close the session
+                        // The write loop might still be working
+                    }
+                }
+            } else {
+                debug!("Session {} read loop ended normally", self_read.id);
+                let _ = self_read.close().await;
             }
-            let _ = self_read.close().await;
         });
         
         // Spawn write task
         tokio::spawn(async move {
             if let Err(e) = self_write.write_loop().await {
-                error!("Session {} write loop error: {}", self_write.id, e);
+                // Only log non-critical errors
+                match &e {
+                    AnyTlsError::Io(io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        debug!("Session {} write loop ended: connection closed", self_write.id);
+                        let _ = self_write.close().await;
+                    }
+                    AnyTlsError::Io(io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
+                        debug!("Session {} write loop ended: broken pipe", self_write.id);
+                        let _ = self_write.close().await;
+                    }
+                    _ => {
+                        error!("Session {} write loop error: {}", self_write.id, e);
+                        let _ = self_write.close().await;
+                    }
+                }
+            } else {
+                debug!("Session {} write loop ended normally", self_write.id);
+                let _ = self_write.close().await;
             }
-            let _ = self_write.close().await;
         });
     }
     

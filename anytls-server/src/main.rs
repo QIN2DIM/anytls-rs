@@ -8,6 +8,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, error, info};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "AnyTLS server", long_about = None)]
@@ -43,8 +44,19 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
 }
 
 async fn handle_stream(mut stream: Stream) -> Result<()> {
+    // Add a small delay to ensure the destination address data has been processed
+    // This is a workaround for the race condition between stream creation and data arrival
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    
     // Read destination address (SOCKS format)
-    let atyp = stream.read_u8().await?;
+    let atyp = match stream.read_u8().await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Failed to read address type: {}", e);
+            return Err(e.into());
+        }
+    };
+    
     let dest_addr = match atyp {
         0x01 => {
             // IPv4
@@ -69,6 +81,7 @@ async fn handle_stream(mut stream: Stream) -> Result<()> {
             format!("[{}]:{}", std::net::Ipv6Addr::from(addr), port)
         }
         _ => {
+            error!("Unsupported address type: {}", atyp);
             return Err(anyhow::anyhow!("Unsupported address type: {}", atyp));
         }
     };
@@ -78,36 +91,71 @@ async fn handle_stream(mut stream: Stream) -> Result<()> {
     // Check for UDP-over-TCP
     if dest_addr.contains("udp-over-tcp.arpa") {
         // TODO: Implement UDP-over-TCP support
+        error!("UDP-over-TCP not yet implemented");
         return Err(anyhow::anyhow!("UDP-over-TCP not yet implemented"));
     }
     
-    // Connect to destination
-    let dest_stream = match TcpStream::connect(&dest_addr).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Connect to destination with timeout
+    let connect_timeout = Duration::from_secs(30);
+    let dest_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&dest_addr)).await {
+        Ok(Ok(s)) => {
+            debug!("Successfully connected to {}", dest_addr);
+            s
+        }
+        Ok(Err(e)) => {
             error!("Failed to connect to {}: {}", dest_addr, e);
-            return Err(e.into());
+            // Explicitly close the stream to notify the client
+            drop(stream);
+            return Err(anyhow::anyhow!("Failed to connect to {}: {}", dest_addr, e));
+        }
+        Err(_) => {
+            error!("Connection to {} timed out", dest_addr);
+            // Explicitly close the stream to notify the client
+            drop(stream);
+            return Err(anyhow::anyhow!("Connection to {} timed out", dest_addr));
         }
     };
+    
+    debug!("Starting data proxy for {}", dest_addr);
     
     // Split streams
     let (mut stream_read, mut stream_write) = tokio::io::split(stream);
     let (mut dest_read, mut dest_write) = dest_stream.into_split();
     
     // Proxy data bidirectionally
-    tokio::select! {
-        result = tokio::io::copy(&mut stream_read, &mut dest_write) => {
-            if let Err(e) = result {
+    let client_to_dest = tokio::spawn(async move {
+        match tokio::io::copy(&mut stream_read, &mut dest_write).await {
+            Ok(bytes) => {
+                debug!("Client to destination copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
                 debug!("Client to destination copy error: {}", e);
             }
         }
-        result = tokio::io::copy(&mut dest_read, &mut stream_write) => {
-            if let Err(e) = result {
+    });
+    
+    let dest_to_client = tokio::spawn(async move {
+        match tokio::io::copy(&mut dest_read, &mut stream_write).await {
+            Ok(bytes) => {
+                debug!("Destination to client copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
                 debug!("Destination to client copy error: {}", e);
             }
         }
+    });
+    
+    // Wait for either direction to complete
+    tokio::select! {
+        _ = client_to_dest => {
+            debug!("Client to destination copy finished for {}", dest_addr);
+        }
+        _ = dest_to_client => {
+            debug!("Destination to client copy finished for {}", dest_addr);
+        }
     }
     
+    debug!("Stream handling completed for {}", dest_addr);
     Ok(())
 }
 
@@ -127,14 +175,21 @@ async fn handle_connection(
         Box::new(|stream| {
             tokio::spawn(async move {
                 if let Err(e) = handle_stream(stream).await {
-                    debug!("Stream handling error: {}", e);
+                    // Only log the error, don't propagate it to avoid closing the entire session
+                    error!("Stream handling error: {}", e);
                 }
             });
         }),
     ).await?;
     
     // Run session
-    Arc::new(session).run();
+    let session_arc = Arc::new(session);
+    session_arc.clone().run();
+    
+    // Keep the connection alive until the session is closed
+    while !session_arc.is_closed().await {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     
     Ok(())
 }

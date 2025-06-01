@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, info};
+use tracing::{debug, info, error};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "AnyTLS client", long_about = None)]
@@ -209,10 +209,22 @@ async fn handle_socks5_connection(
     debug!("SOCKS5 connection to {}", dest_addr);
     
     // Get session and open stream
-    let session = session_manager.get_or_create_session().await?;
+    let session = match session_manager.get_or_create_session().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to get/create session: {}", e);
+            // Send connection refused error to client
+            stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+            return Err(e);
+        }
+    };
+    
     let mut anytls_stream = match session.open_stream().await {
         Ok(s) => s,
         Err(e) => {
+            error!("Failed to open stream: {}", e);
+            // Send general failure error to client
+            stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
             session_manager.return_session(session).await;
             return Err(e.into());
         }
@@ -249,7 +261,16 @@ async fn handle_socks5_connection(
         }
     }
     
-    anytls_stream.write_all(&dest_data).await?;
+    // Send destination address to server
+    if let Err(e) = anytls_stream.write_all(&dest_data).await {
+        error!("Failed to send destination address: {}", e);
+        // Send general failure error to client
+        stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
+        session_manager.return_session(session).await;
+        return Err(e.into());
+    }
+    
+    debug!("Sent destination address to server, starting proxy");
     
     // Send success response
     stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await?;
@@ -258,22 +279,32 @@ async fn handle_socks5_connection(
     let (mut stream_read, mut stream_write) = stream.into_split();
     let (mut anytls_read, mut anytls_write) = tokio::io::split(anytls_stream);
     
-    let proxy_task = tokio::spawn(async move {
-        tokio::select! {
-            result = tokio::io::copy(&mut stream_read, &mut anytls_write) => {
-                if let Err(e) = result {
-                    debug!("Client to server copy error: {}", e);
-                }
+    let client_to_server = tokio::spawn(async move {
+        match tokio::io::copy(&mut stream_read, &mut anytls_write).await {
+            Ok(bytes) => {
+                debug!("Client to server copy completed: {} bytes", bytes);
             }
-            result = tokio::io::copy(&mut anytls_read, &mut stream_write) => {
-                if let Err(e) = result {
-                    debug!("Server to client copy error: {}", e);
-                }
+            Err(e) => {
+                debug!("Client to server copy error: {}", e);
             }
         }
     });
     
-    let _ = proxy_task.await;
+    let server_to_client = tokio::spawn(async move {
+        match tokio::io::copy(&mut anytls_read, &mut stream_write).await {
+            Ok(bytes) => {
+                debug!("Server to client copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
+                debug!("Server to client copy error: {}", e);
+            }
+        }
+    });
+    
+    // Wait for both tasks to complete
+    let _ = tokio::join!(client_to_server, server_to_client);
+    
+    debug!("SOCKS5 connection completed for {}", dest_addr);
     session_manager.return_session(session).await;
     
     Ok(())
