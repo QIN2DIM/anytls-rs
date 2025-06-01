@@ -14,6 +14,7 @@ anytls-core = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

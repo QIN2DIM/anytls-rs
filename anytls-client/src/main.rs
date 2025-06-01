@@ -17,7 +17,7 @@ use tracing::{debug, info, error};
 #[derive(Parser, Debug)]
 #[command(author, version, about = "AnyTLS client", long_about = None)]
 struct Args {
-    /// Local SOCKS5 listen address
+    /// Local HTTP/SOCKS5 mixed listen address
     #[arg(short = 'l', long, default_value = "127.0.0.1:1080")]
     listen: String,
     
@@ -28,6 +28,10 @@ struct Args {
     /// Server Name Indication (SNI)
     #[arg(long, default_value = "")]
     sni: String,
+    
+    /// Skip TLS certificate verification (insecure)
+    #[arg(long, default_value = "false")]
+    insecure: bool,
     
     /// Password
     #[arg(short = 'p', long)]
@@ -310,6 +314,198 @@ async fn handle_socks5_connection(
     Ok(())
 }
 
+/// Detect protocol type from first byte
+async fn detect_protocol(stream: &mut TcpStream) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    stream.peek(&mut buf).await?;
+    Ok(buf[0])
+}
+
+/// Parse HTTP CONNECT request
+async fn parse_http_connect(stream: &mut TcpStream) -> Result<String> {
+    let mut buffer = Vec::new();
+    let mut temp_buf = [0u8; 1];
+    
+    // Read until we find \r\n\r\n
+    loop {
+        stream.read_exact(&mut temp_buf).await?;
+        buffer.push(temp_buf[0]);
+        
+        if buffer.len() >= 4 && &buffer[buffer.len()-4..] == b"\r\n\r\n" {
+            break;
+        }
+        
+        if buffer.len() > 8192 {
+            return Err(anyhow::anyhow!("HTTP header too large"));
+        }
+    }
+    
+    let request = String::from_utf8_lossy(&buffer);
+    let lines: Vec<&str> = request.lines().collect();
+    
+    if lines.is_empty() {
+        return Err(anyhow::anyhow!("Empty HTTP request"));
+    }
+    
+    let parts: Vec<&str> = lines[0].split_whitespace().collect();
+    if parts.len() < 2 || parts[0] != "CONNECT" {
+        return Err(anyhow::anyhow!("Not a CONNECT request"));
+    }
+    
+    Ok(parts[1].to_string())
+}
+
+/// Handle HTTP CONNECT proxy
+async fn handle_http_connect(
+    mut stream: TcpStream,
+    session_manager: Arc<SessionManager>,
+) -> Result<()> {
+    // Parse CONNECT request
+    let dest_addr = parse_http_connect(&mut stream).await?;
+    
+    debug!("HTTP CONNECT to {}", dest_addr);
+    
+    // Get session and open stream
+    let session = match session_manager.get_or_create_session().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to get/create session: {}", e);
+            let error_response = format!(
+                "HTTP/1.1 502 Bad Gateway\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(error_response.as_bytes()).await;
+            return Err(e);
+        }
+    };
+    
+    let mut anytls_stream = match session.open_stream().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to open stream: {}", e);
+            let error_response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\n\
+                Content-Length: 0\r\n\
+                Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(error_response.as_bytes()).await;
+            session_manager.return_session(session).await;
+            return Err(e.into());
+        }
+    };
+    
+    // Send destination address in SOCKS format
+    let mut dest_data = BytesMut::new();
+    if let Ok(addr) = dest_addr.parse::<SocketAddr>() {
+        match addr {
+            SocketAddr::V4(v4) => {
+                dest_data.put_u8(0x01);
+                dest_data.put_slice(&v4.ip().octets());
+                dest_data.put_u16(v4.port());
+            }
+            SocketAddr::V6(v6) => {
+                dest_data.put_u8(0x04);
+                dest_data.put_slice(&v6.ip().octets());
+                dest_data.put_u16(v6.port());
+            }
+        }
+    } else {
+        // Try to parse as domain:port
+        if let Some((domain, port)) = dest_addr.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                dest_data.put_u8(0x03);
+                dest_data.put_u8(domain.len() as u8);
+                dest_data.put_slice(domain.as_bytes());
+                dest_data.put_u16(port);
+            } else {
+                return Err(anyhow::anyhow!("Invalid destination format"));
+            }
+        } else {
+            return Err(anyhow::anyhow!("Invalid destination format"));
+        }
+    }
+    
+    // Send destination address to server
+    if let Err(e) = anytls_stream.write_all(&dest_data).await {
+        error!("Failed to send destination address: {}", e);
+        let error_response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(error_response.as_bytes()).await;
+        session_manager.return_session(session).await;
+        return Err(e.into());
+    }
+    
+    debug!("Sent destination address to server, starting proxy");
+    
+    // Send 200 Connection Established
+    let success_response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    stream.write_all(success_response.as_bytes()).await?;
+    
+    // Proxy data
+    let (mut stream_read, mut stream_write) = stream.into_split();
+    let (mut anytls_read, mut anytls_write) = tokio::io::split(anytls_stream);
+    
+    let client_to_server = tokio::spawn(async move {
+        match tokio::io::copy(&mut stream_read, &mut anytls_write).await {
+            Ok(bytes) => {
+                debug!("Client to server copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
+                debug!("Client to server copy error: {}", e);
+            }
+        }
+    });
+    
+    let server_to_client = tokio::spawn(async move {
+        match tokio::io::copy(&mut anytls_read, &mut stream_write).await {
+            Ok(bytes) => {
+                debug!("Server to client copy completed: {} bytes", bytes);
+            }
+            Err(e) => {
+                debug!("Server to client copy error: {}", e);
+            }
+        }
+    });
+    
+    // Wait for both tasks to complete
+    let _ = tokio::join!(client_to_server, server_to_client);
+    
+    debug!("HTTP CONNECT completed for {}", dest_addr);
+    session_manager.return_session(session).await;
+    
+    Ok(())
+}
+
+/// Handle incoming connection with protocol detection
+async fn handle_connection(
+    mut stream: TcpStream,
+    session_manager: Arc<SessionManager>,
+) -> Result<()> {
+    // Detect protocol by first byte
+    let first_byte = detect_protocol(&mut stream).await?;
+    
+    match first_byte {
+        0x05 => {
+            // SOCKS5 protocol
+            debug!("Detected SOCKS5 protocol");
+            handle_socks5_connection(stream, session_manager).await
+        }
+        b'C' | b'c' => {
+            // Likely HTTP CONNECT
+            debug!("Detected HTTP protocol");
+            handle_http_connect(stream, session_manager).await
+        }
+        _ => {
+            debug!("Unknown protocol, first byte: 0x{:02x}", first_byte);
+            Err(anyhow::anyhow!("Unsupported protocol"))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -323,7 +519,19 @@ async fn main() -> Result<()> {
         .init();
     
     info!("[Client] {}", PROGRAM_VERSION);
-    info!("[Client] SOCKS5 {} => {}", args.listen, args.server);
+    info!("[Client] HTTP/SOCKS5 {} => {}", args.listen, args.server);
+    
+    // Determine SNI hostname
+    let server_name = if !args.sni.is_empty() {
+        // Use provided SNI
+        info!("[Client] Using SNI: {}", args.sni);
+        args.sni.clone()
+    } else {
+        // Extract hostname from server address
+        let hostname = args.server.split(':').next().unwrap_or("localhost").to_string();
+        info!("[Client] Using server hostname as SNI: {}", hostname);
+        hostname
+    };
     
     // Setup TLS configuration
     let mut root_store = rustls::RootCertStore::empty();
@@ -337,16 +545,15 @@ async fn main() -> Result<()> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
     
-    // Handle insecure connections if SNI is an IP address
-    let server_name = if !args.sni.is_empty() {
-        args.sni.clone()
-    } else {
-        args.server.split(':').next().unwrap_or("localhost").to_string()
-    };
-    
     // Check if SNI is an IP address (which means we should skip verification)
     let is_ip = server_name.parse::<std::net::IpAddr>().is_ok();
-    if is_ip {
+    if is_ip || args.insecure {
+        if is_ip {
+            info!("[Client] SNI is an IP address, skipping certificate verification");
+        } else if args.insecure {
+            info!("[Client] Insecure mode enabled, skipping certificate verification");
+        }
+        
         // Create a custom certificate verifier that accepts any certificate
         #[derive(Debug)]
         struct InsecureVerifier;
@@ -420,20 +627,20 @@ async fn main() -> Result<()> {
         }
     });
     
-    // Listen for SOCKS5 connections
+    // Listen for connections
     let listener = TcpListener::bind(&args.listen).await
-        .context("Failed to bind SOCKS5 listener")?;
+        .context("Failed to bind listener")?;
     
-    info!("SOCKS5 server listening on {}", args.listen);
+    info!("HTTP/SOCKS5 mixed proxy server listening on {}", args.listen);
     
     loop {
         let (stream, addr) = listener.accept().await?;
         let session_manager = session_manager.clone();
         
         tokio::spawn(async move {
-            debug!("New SOCKS5 connection from {}", addr);
-            if let Err(e) = handle_socks5_connection(stream, session_manager).await {
-                debug!("SOCKS5 connection error: {}", e);
+            debug!("New connection from {}", addr);
+            if let Err(e) = handle_connection(stream, session_manager).await {
+                debug!("Connection error: {}", e);
             }
         });
     }

@@ -9,6 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{debug, error, info};
 use std::time::Duration;
+use std::fs::File;
+use std::io::BufReader;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "AnyTLS server", long_about = None)]
@@ -24,6 +26,14 @@ struct Args {
     /// Padding scheme file
     #[arg(long)]
     padding_scheme: Option<String>,
+    
+    /// Certificate file path (PEM format)
+    #[arg(long)]
+    certificate: Option<String>,
+    
+    /// Private key file path (PEM format)
+    #[arg(long)]
+    private_key: Option<String>,
     
     /// Log level
     #[arg(long, default_value = "info")]
@@ -41,6 +51,33 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
         vec![cert_der],
         key_der,
     ))
+}
+
+/// Load certificate chain and private key from files
+fn load_certs_and_key(cert_path: &str, key_path: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    // Load certificate chain
+    let cert_file = File::open(cert_path)
+        .context(format!("Failed to open certificate file: {}", cert_path))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse certificate PEM")?;
+    
+    if certs.is_empty() {
+        return Err(anyhow::anyhow!("No certificates found in {}", cert_path));
+    }
+    
+    // Load private key
+    let key_file = File::open(key_path)
+        .context(format!("Failed to open private key file: {}", key_path))?;
+    let mut key_reader = BufReader::new(key_file);
+    
+    // Try different private key formats
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .context("Failed to parse private key PEM")?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+    
+    Ok((certs, key))
 }
 
 async fn handle_stream(mut stream: Stream) -> Result<()> {
@@ -223,9 +260,18 @@ async fn main() -> Result<()> {
         info!("Loaded custom padding scheme: {}", padding_scheme.md5);
     }
     
-    // Generate self-signed certificate
-    let (cert_chain, key_der) = generate_self_signed_cert()
-        .context("Failed to generate self-signed certificate")?;
+    // Load certificate and private key if provided
+    let (cert_chain, key_der) = if let (Some(cert_path), Some(key_path)) = (args.certificate.as_ref(), args.private_key.as_ref()) {
+        info!("Loading certificate from {} and private key from {}", cert_path, key_path);
+        load_certs_and_key(cert_path, key_path)
+            .context("Failed to load certificate and private key")?
+    } else if args.certificate.is_some() || args.private_key.is_some() {
+        return Err(anyhow::anyhow!("Both certificate and private-key must be provided together"));
+    } else {
+        info!("No certificate provided, generating self-signed certificate");
+        generate_self_signed_cert()
+            .context("Failed to generate self-signed certificate")?
+    };
     
     // Setup TLS configuration
     let tls_config = rustls::ServerConfig::builder()
