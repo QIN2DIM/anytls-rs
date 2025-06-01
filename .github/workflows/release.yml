@@ -17,24 +17,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: anytls
             asset_name: anytls_linux_amd64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: anytls
             asset_name: anytls_linux_arm64
             use_cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: anytls.exe
-            asset_name: anytls_windows_amd64.exe
+            asset_name: anytls_windows_amd64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: anytls
             asset_name: anytls_darwin_amd64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: anytls
             asset_name: anytls_darwin_arm64
 
     steps:
@@ -116,13 +111,13 @@ jobs:
 
     - name: Upload Release Assets
       run: |
-        for artifact in artifacts/*; do
-          if [ -d "$artifact" ]; then
-            for file in $artifact/*; do
-              if [ -f "$file" ]; then
-                asset_name=$(basename "$file")
-                echo "Uploading $asset_name"
-                gh release upload ${{ github.ref_name }} "$file" --clobber
+        for artifact_dir in artifacts/*; do
+          if [ -d "$artifact_dir" ]; then
+            for file_in_artifact_dir in "$artifact_dir"/*; do
+              if [ -f "$file_in_artifact_dir" ]; then
+                asset_filename=$(basename "$file_in_artifact_dir")
+                echo "Uploading $asset_filename from $file_in_artifact_dir"
+                gh release upload ${{ github.ref_name }} "$file_in_artifact_dir" --clobber
               fi
             done
           fi
