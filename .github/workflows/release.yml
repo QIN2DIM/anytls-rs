@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: anytls
+            asset_name: anytls_linux_amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: anytls
+            asset_name: anytls_linux_arm64
+            use_cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: anytls.exe
+            asset_name: anytls_windows_amd64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: anytls
+            asset_name: anytls_darwin_amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: anytls
+            asset_name: anytls_darwin_arm64
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install cross
+      if: matrix.use_cross
+      run: cargo install cross
+
+    - name: Build client
+      run: |
+        if [ "${{ matrix.use_cross }}" = "true" ]; then
+          cross build --release --bin anytls-client --target ${{ matrix.target }}
+        else
+          cargo build --release --bin anytls-client --target ${{ matrix.target }}
+        fi
+      shell: bash
+
+    - name: Build server
+      run: |
+        if [ "${{ matrix.use_cross }}" = "true" ]; then
+          cross build --release --bin anytls-server --target ${{ matrix.target }}
+        else
+          cargo build --release --bin anytls-server --target ${{ matrix.target }}
+        fi
+      shell: bash
+
+    - name: Package binaries
+      run: |
+        mkdir -p dist
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          cp target/${{ matrix.target }}/release/anytls-client.exe dist/anytls-client.exe
+          cp target/${{ matrix.target }}/release/anytls-server.exe dist/anytls-server.exe
+          cd dist && 7z a -tzip ../${{ matrix.asset_name }}.zip *
+        else
+          cp target/${{ matrix.target }}/release/anytls-client dist/
+          cp target/${{ matrix.target }}/release/anytls-server dist/
+          cd dist && tar czf ../${{ matrix.asset_name }}.tar.gz *
+        fi
+      shell: bash
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.asset_name }}
+        path: |
+          *.zip
+          *.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+    - name: Upload Release Assets
+      run: |
+        for artifact in artifacts/*; do
+          if [ -d "$artifact" ]; then
+            for file in $artifact/*; do
+              if [ -f "$file" ]; then
+                asset_name=$(basename "$file")
+                echo "Uploading $asset_name"
+                gh release upload ${{ github.ref_name }} "$file" --clobber
+              fi
+            done
+          fi
+        done
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
