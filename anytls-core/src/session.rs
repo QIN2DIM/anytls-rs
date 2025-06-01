@@ -431,6 +431,11 @@ impl Session {
             
             // Handle frame
             match cmd {
+                CMD_WASTE => {
+                    // Padding frame, just ignore it
+                    debug!("Received WASTE frame with {} bytes", length);
+                }
+                
                 CMD_PSH => {
                     let streams = self.streams.lock().await;
                     if let Some(stream_tx) = streams.get(&stream_id) {
