@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.1.0). This will create a new tag.'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +40,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -92,11 +100,36 @@ jobs:
       contents: write
     steps:
     - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Configure Git User
+      run: |
+        git config user.name "GitHub Actions Bot"
+        git config user.email "actions@github.com"
+
+    - name: Create and Push Tag (Manual Dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        echo "Creating and pushing tag ${{ github.event.inputs.version }}"
+        git tag ${{ github.event.inputs.version }}
+        git push origin ${{ github.event.inputs.version }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Download artifacts
       uses: actions/download-artifact@v3
       with:
         path: artifacts
+
+    - name: Set Release Version
+      id: set_version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+        fi
 
     - name: Create Release
       id: create_release
@@ -104,8 +137,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
+        tag_name: ${{ steps.set_version.outputs.version }}
+        release_name: Release ${{ steps.set_version.outputs.version }}
         draft: false
         prerelease: false
 
@@ -116,8 +149,8 @@ jobs:
             for file_in_artifact_dir in "$artifact_dir"/*; do
               if [ -f "$file_in_artifact_dir" ]; then
                 asset_filename=$(basename "$file_in_artifact_dir")
-                echo "Uploading $asset_filename from $file_in_artifact_dir"
-                gh release upload ${{ github.ref_name }} "$file_in_artifact_dir" --clobber
+                echo "Uploading $asset_filename from $file_in_artifact_dir to release ${{ steps.set_version.outputs.version }}"
+                gh release upload ${{ steps.set_version.outputs.version }} "$file_in_artifact_dir" --clobber
               fi
             done
           fi
